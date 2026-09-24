@@ -1,0 +1,505 @@
+# =============================================================================
+#  Lakehouse Medallion — E-commerce Analytics Platform
+# -----------------------------------------------------------------------------
+#  Service groups (see COMPOSE_PROFILES in .env):
+#    <no profile> : minio, minio-init, postgres, kafka, kafka-init, kafka-ui
+#    spark        : spark-master, spark-worker, spark-thrift
+#    airflow      : airflow-init, airflow-scheduler, airflow-webserver
+#    dbt          : dbt
+#    tools        : datagen
+# =============================================================================
+name: lakehouse-medallion
+
+# ----------------------------------------------------------------------------
+#  Shared environment: everything a container needs to reach the lakehouse.
+# ----------------------------------------------------------------------------
+x-lakehouse-env: &lakehouse-env
+  TZ: ${TZ:-UTC}
+  # S3 / MinIO
+  S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+  LAKEHOUSE_BUCKET: ${LAKEHOUSE_BUCKET:-lakehouse}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+  AWS_REGION: ${AWS_REGION:-us-east-1}
+  AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+  # Kafka
+  KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+  # PostgreSQL / Hive Metastore
+  POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+  POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+  POSTGRES_USER: ${POSTGRES_USER}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  METASTORE_DB: ${METASTORE_DB:-metastore}
+
+x-spark-env: &spark-env
+  <<: *lakehouse-env
+  # So a job can `from ingestion.generator.schemas import ...`: the domain
+  # contract is defined once and shared by the generator and the Spark jobs.
+  PYTHONPATH: /opt/lakehouse
+  SPARK_MASTER_URL: ${SPARK_MASTER_URL:-spark://spark-master:7077}
+  SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-2g}
+  SPARK_EXECUTOR_MEMORY: ${SPARK_EXECUTOR_MEMORY:-2g}
+
+x-airflow-env: &airflow-env
+  <<: *lakehouse-env
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+  AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+  AIRFLOW__CORE__PARALLELISM: 8
+  AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG: 1
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow
+  AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+  AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+  AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+  AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: 30
+  AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+  AIRFLOW_UID: ${AIRFLOW_UID:-50000}
+  # Where this project lives ON THE HOST. The DockerOperator talks to the
+  # host's docker daemon, so the paths it mounts are resolved by the host,
+  # not inside the Airflow container.
+  LAKEHOUSE_HOST_DIR: ${LAKEHOUSE_HOST_DIR:-/opt/lakehouse-host}
+  COMPOSE_NETWORK: ${COMPOSE_NETWORK:-lakehouse-medallion}
+
+x-restart: &restart
+  restart: unless-stopped
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+
+services:
+
+  # ===========================================================================
+  #  OBJECT STORAGE — MinIO (S3-compatible). This IS the data lake.
+  # ===========================================================================
+  minio:
+    image: quay.io/minio/minio:${MINIO_VERSION:-RELEASE.2025-04-22T22-12-26Z}
+    container_name: lh-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_DOMAIN: minio
+      TZ: ${TZ:-UTC}
+    ports:
+      - "${MINIO_API_PORT:-19000}:9000"      # S3 API
+      - "${MINIO_CONSOLE_PORT:-19001}:9001"  # Web console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 15s
+    networks: [lakehouse]
+    <<: [*restart, *logging]
+
+  # One-shot: creates the `lakehouse` bucket + medallion prefixes, then exits.
+  minio-init:
+    image: quay.io/minio/mc:${MC_VERSION:-RELEASE.2025-05-21T01-59-54Z}
+    container_name: lh-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+      LAKEHOUSE_BUCKET: ${LAKEHOUSE_BUCKET:-lakehouse}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    entrypoint: ["/bin/sh", "/scripts/minio_init.sh"]
+    volumes:
+      - ./scripts:/scripts:ro
+    networks: [lakehouse]
+    restart: "no"
+
+  # ===========================================================================
+  #  POSTGRESQL — three logical databases: airflow, metastore, analytics
+  # ===========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: lh-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-lakehouse}
+      POSTGRES_MULTIPLE_DATABASES: ${POSTGRES_MULTIPLE_DATABASES:-airflow,metastore,analytics}
+      METASTORE_DB: ${METASTORE_DB:-metastore}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      TZ: ${TZ:-UTC}
+    ports:
+      - "${POSTGRES_EXTERNAL_PORT:-15432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./docker/postgres/hive-schema:/hive-schema:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB:-lakehouse}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks: [lakehouse]
+    <<: [*restart, *logging]
+
+  # ===========================================================================
+  #  KAFKA — single-node broker in KRaft mode (no ZooKeeper)
+  # ---------------------------------------------------------------------------
+  #  Two listeners on purpose:
+  #    PLAINTEXT      :9092  -> reached as `kafka:9092` from other containers
+  #    PLAINTEXT_HOST :29092 -> reached as `localhost:29092` from your laptop
+  #  A Kafka client always reconnects to the ADVERTISED address, which is why
+  #  one single port cannot serve both worlds.
+  # ===========================================================================
+  kafka:
+    image: apache/kafka:${KAFKA_VERSION:-3.9.0}
+    container_name: lh-kafka
+    environment:
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-5L6g3nShT-eMCtK--X86sw}
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:${KAFKA_EXTERNAL_PORT:-29092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      TZ: ${TZ:-UTC}
+    ports:
+      - "${KAFKA_EXTERNAL_PORT:-29092}:29092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 20s
+    networks: [lakehouse]
+    <<: [*restart, *logging]
+
+  # One-shot: creates the e-commerce topics, then exits.
+  kafka-init:
+    image: apache/kafka:${KAFKA_VERSION:-3.9.0}
+    container_name: lh-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+    entrypoint: ["/bin/sh", "/scripts/create_topics.sh"]
+    volumes:
+      - ./scripts:/scripts:ro
+    networks: [lakehouse]
+    restart: "no"
+
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:latest
+    container_name: lh-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      DYNAMIC_CONFIG_ENABLED: "true"
+      KAFKA_CLUSTERS_0_NAME: lakehouse-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      SERVER_SERVLET_CONTEXT_PATH: /
+      TZ: ${TZ:-UTC}
+    ports:
+      - "${KAFKA_UI_PORT:-18085}:8080"
+    networks: [lakehouse]
+    <<: [*restart, *logging]
+
+  # ===========================================================================
+  #  SPARK — standalone cluster (1 master + 1 worker) + Thrift Server for dbt
+  # ===========================================================================
+  spark-master:
+    build:
+      context: .
+      dockerfile: docker/spark/Dockerfile
+    image: lakehouse-medallion/spark:3.5.9
+    container_name: lh-spark-master
+    profiles: [spark]
+    depends_on:
+      minio:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *spark-env
+      SPARK_MODE: master
+    ports:
+      - "${SPARK_MASTER_UI_PORT:-18081}:8080"   # Master Web UI
+      - "${SPARK_SUBMIT_PORT:-7077}:7077"                            # Cluster submit port
+    volumes:
+      - ./spark:/opt/lakehouse/spark:ro
+      - ./ingestion:/opt/lakehouse/ingestion:ro
+      - ./scripts:/opt/lakehouse/scripts:ro
+      - ./tests:/opt/lakehouse/tests:ro
+      - ./data:/opt/lakehouse/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080 >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [lakehouse]
+    <<: [*restart, *logging]
+
+  spark-worker:
+    image: lakehouse-medallion/spark:3.5.9
+    container_name: lh-spark-worker
+    profiles: [spark]
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    environment:
+      <<: *spark-env
+      SPARK_MODE: worker
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-4G}
+    ports:
+      - "${SPARK_WORKER_UI_PORT:-18082}:8081"
+    volumes:
+      - ./spark:/opt/lakehouse/spark:ro
+      - ./ingestion:/opt/lakehouse/ingestion:ro
+      - ./scripts:/opt/lakehouse/scripts:ro
+      - ./tests:/opt/lakehouse/tests:ro
+      - ./data:/opt/lakehouse/data
+    networks: [lakehouse]
+    <<: [*restart, *logging]
+
+  # One-shot: registers the medallion databases in the catalog, then exits.
+  # The metastore TABLES themselves are created by PostgreSQL's init script
+  # (docker/postgres/init/02-init-hive-metastore.sh) from the official Hive DDL.
+  metastore-init:
+    image: lakehouse-medallion/spark:3.5.9
+    container_name: lh-metastore-init
+    profiles: [spark]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      <<: *spark-env
+      SPARK_MODE: client
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - local[1]
+      - /opt/lakehouse/scripts/init_metastore.py
+    volumes:
+      - ./scripts:/opt/lakehouse/scripts:ro
+    networks: [lakehouse]
+    restart: "no"
+
+  # JDBC/HiveServer2 endpoint on :10000 — this is what dbt-spark connects to.
+  spark-thrift:
+    image: lakehouse-medallion/spark:3.5.9
+    container_name: lh-spark-thrift
+    profiles: [spark]
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      metastore-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *spark-env
+      SPARK_MODE: thrift
+    ports:
+      - "${SPARK_THRIFT_PORT:-10000}:10000"
+      - "${SPARK_APP_UI_PORT:-4040}:4040"                            # Spark application UI
+    volumes:
+      - ./spark:/opt/lakehouse/spark:ro
+    networks: [lakehouse]
+    <<: [*restart, *logging]
+
+  # ===========================================================================
+  #  AIRFLOW — orchestration (LocalExecutor: no Redis, no Celery workers)
+  # ===========================================================================
+  # One-shot: DB migration + admin user creation, following the upstream
+  # Airflow compose pattern.
+  #
+  # It runs as root (0:0) on purpose: it must chown the bind-mounted folders.
+  # And it ends with `exec /entrypoint ...` rather than replacing the
+  # entrypoint, because the official entrypoint is what registers an arbitrary
+  # AIRFLOW_UID in /etc/passwd. Bypassing it yields:
+  #   "The user that Airflow is running as has no username"
+  airflow-init:
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+    image: lakehouse-medallion/airflow:2.10.5
+    container_name: lh-airflow-init
+    profiles: [airflow]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *airflow-env
+      # Consumed by the official image entrypoint: migrate the DB and create
+      # the admin user. Scoped to this one-shot service only.
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-admin}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
+    user: "0:0"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        echo "[airflow-init] preparing directories"
+        mkdir -p /opt/airflow/{logs,dags,plugins,config}
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/{logs,dags,plugins,config}
+        echo "[airflow-init] migrating database and creating admin user"
+        exec /entrypoint airflow version
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/config:/opt/airflow/config
+    networks: [lakehouse]
+    restart: "no"
+
+  airflow-scheduler:
+    image: lakehouse-medallion/airflow:2.10.5
+    container_name: lh-airflow-scheduler
+    profiles: [airflow]
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment: *airflow-env
+    user: "${AIRFLOW_UID:-50000}:0"
+    group_add:
+      - "${DOCKER_GID:-999}"
+    command: scheduler
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/config:/opt/airflow/config
+      - ./dbt:/opt/airflow/dbt
+      - ./spark:/opt/airflow/spark:ro
+      # Lets Airflow launch sibling containers via the DockerOperator (phase 9)
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+    networks: [lakehouse]
+    <<: [*restart, *logging]
+
+  airflow-webserver:
+    image: lakehouse-medallion/airflow:2.10.5
+    container_name: lh-airflow-webserver
+    profiles: [airflow]
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment: *airflow-env
+    user: "${AIRFLOW_UID:-50000}:0"
+    command: webserver
+    ports:
+      - "${AIRFLOW_WEB_PORT:-18088}:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/config:/opt/airflow/config
+      - ./dbt:/opt/airflow/dbt
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks: [lakehouse]
+    <<: [*restart, *logging]
+
+  # ===========================================================================
+  #  DBT — idle container; you drive it with `docker compose exec dbt dbt run`
+  # ===========================================================================
+  dbt:
+    build:
+      context: .
+      dockerfile: docker/dbt/Dockerfile
+    image: lakehouse-medallion/dbt:1.9
+    container_name: lh-dbt
+    profiles: [dbt]
+    # dbt writes target/ and logs/ inside the bind-mounted project directory,
+    # so it must run as the host user rather than the image's built-in uid.
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      <<: *lakehouse-env
+      DBT_PROFILES_DIR: /opt/dbt
+      DBT_SPARK_HOST: spark-thrift
+      DBT_SPARK_PORT: 10000
+      DBT_SPARK_SCHEMA: gold
+    command: ["sleep", "infinity"]
+    volumes:
+      - ./dbt:/opt/dbt
+    networks: [lakehouse]
+    <<: [*restart, *logging]
+
+  # ===========================================================================
+  #  DATAGEN — synthetic e-commerce events + Kafka producer (phases 2 & 3)
+  # ===========================================================================
+  datagen:
+    build:
+      context: .
+      dockerfile: docker/python/Dockerfile
+    image: lakehouse-medallion/python-tools:3.12
+    container_name: lh-datagen
+    profiles: [tools]
+    # The generator writes CSV/JSON into ./data, a bind mount.
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      <<: *lakehouse-env
+      GEN_NUM_CUSTOMERS: ${GEN_NUM_CUSTOMERS:-5000}
+      GEN_NUM_PRODUCTS: ${GEN_NUM_PRODUCTS:-800}
+      GEN_NUM_ORDERS: ${GEN_NUM_ORDERS:-50000}
+      GEN_SEED: ${GEN_SEED:-42}
+      GEN_NULL_RATE: ${GEN_NULL_RATE:-0.03}
+      GEN_DUPLICATE_RATE: ${GEN_DUPLICATE_RATE:-0.02}
+      GEN_INVALID_RATE: ${GEN_INVALID_RATE:-0.02}
+    command: ["sleep", "infinity"]
+    volumes:
+      - ./ingestion:/opt/lakehouse/ingestion
+      - ./tests:/opt/lakehouse/tests
+      - ./data:/opt/lakehouse/data
+    networks: [lakehouse]
+    <<: [*restart, *logging]
+
+
+networks:
+  lakehouse:
+    name: lakehouse-medallion
+    driver: bridge
+
+volumes:
+  minio-data:
+    name: lakehouse-medallion-minio-data
+  postgres-data:
+    name: lakehouse-medallion-postgres-data
+  kafka-data:
+    name: lakehouse-medallion-kafka-data

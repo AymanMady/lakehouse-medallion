@@ -1,0 +1,59 @@
+# =============================================================================
+#  spark-defaults.conf  (TEMPLATE)
+# -----------------------------------------------------------------------------
+#  This file is rendered at container start by entrypoint.sh (envsubst).
+#  Secrets therefore live ONLY in environment variables / .env, never in Git.
+# =============================================================================
+
+# ------------------------------- Delta Lake ----------------------------------
+# These two lines are what turns a plain SparkSession into a Delta-aware one.
+spark.sql.extensions                                io.delta.sql.DeltaSparkSessionExtension
+spark.sql.catalog.spark_catalog                     org.apache.spark.sql.delta.catalog.DeltaCatalog
+
+# --------------------------- Object storage (S3A) ----------------------------
+# `s3a://` is the Hadoop filesystem connector. Pointing it at MinIO means the
+# exact same code runs unchanged against real AWS S3.
+spark.hadoop.fs.s3a.impl                            org.apache.hadoop.fs.s3a.S3AFileSystem
+spark.hadoop.fs.s3a.endpoint                        ${S3_ENDPOINT}
+spark.hadoop.fs.s3a.access.key                      ${AWS_ACCESS_KEY_ID}
+spark.hadoop.fs.s3a.secret.key                      ${AWS_SECRET_ACCESS_KEY}
+spark.hadoop.fs.s3a.aws.credentials.provider        org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
+# MinIO exposes buckets as a path (minio:9000/lakehouse), not as a subdomain.
+spark.hadoop.fs.s3a.path.style.access               true
+spark.hadoop.fs.s3a.connection.ssl.enabled          false
+spark.hadoop.fs.s3a.fast.upload                     true
+spark.hadoop.fs.s3a.connection.maximum              100
+spark.hadoop.fs.s3a.committer.name                  directory
+
+# --------------------------- Hive Metastore (catalog) ------------------------
+# The metastore is what lets `SELECT * FROM silver.orders` work in Spark SQL
+# and in dbt. We back it with PostgreSQL so every Spark app + the Thrift Server
+# share the same catalog (no standalone Hive Metastore service needed).
+spark.sql.catalogImplementation                     hive
+spark.sql.warehouse.dir                             s3a://${LAKEHOUSE_BUCKET}/warehouse
+spark.hadoop.javax.jdo.option.ConnectionURL         jdbc:postgresql://${POSTGRES_HOST}:${POSTGRES_PORT}/${METASTORE_DB}
+spark.hadoop.javax.jdo.option.ConnectionDriverName  org.postgresql.Driver
+spark.hadoop.javax.jdo.option.ConnectionUserName    ${POSTGRES_USER}
+spark.hadoop.javax.jdo.option.ConnectionPassword    ${POSTGRES_PASSWORD}
+# Schema auto-creation is DISABLED by default: it is not concurrency-safe and
+# deadlocks PostgreSQL when two Spark apps start against an empty metastore.
+# The `metastore-init` one-shot service creates the schema once with
+# METASTORE_AUTO_CREATE=true, before anything else connects.
+spark.hadoop.datanucleus.schema.autoCreateAll       ${METASTORE_AUTO_CREATE}
+spark.hadoop.datanucleus.autoCreateSchema           ${METASTORE_AUTO_CREATE}
+spark.hadoop.datanucleus.fixedDatastore             false
+spark.hadoop.hive.metastore.schema.verification     false
+spark.hadoop.hive.metastore.schema.verification.record.version false
+
+# ------------------------------- Execution -----------------------------------
+spark.master                                        ${SPARK_MASTER_URL}
+spark.driver.memory                                 ${SPARK_DRIVER_MEMORY}
+spark.executor.memory                               ${SPARK_EXECUTOR_MEMORY}
+spark.serializer                                    org.apache.spark.serializer.KryoSerializer
+spark.sql.session.timeZone                          UTC
+spark.sql.adaptive.enabled                          true
+spark.sql.adaptive.coalescePartitions.enabled       true
+# 200 is the Spark default and is far too high for a laptop-sized dataset.
+spark.sql.shuffle.partitions                        8
+spark.ui.showConsoleProgress                        false
+spark.eventLog.enabled                              false

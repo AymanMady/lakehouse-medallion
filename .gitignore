@@ -1,0 +1,61 @@
+# ---------------------------- Secrets ----------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# ---------------------------- Python -----------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# ---------------------------- Airflow ----------------------------------------
+airflow/logs/*
+!airflow/logs/.gitkeep
+airflow/airflow.db
+airflow/airflow.cfg
+airflow/webserver_config.py
+airflow/standalone_admin_password.txt
+
+# ------------------------------ dbt ------------------------------------------
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+dbt/.user.yml
+
+# ----------------------------- Spark -----------------------------------------
+spark-warehouse/
+metastore_db/
+derby.log
+spark/events/
+
+# ------------------------- Local data / lake ---------------------------------
+data/raw/*
+!data/raw/.gitkeep
+data/output/
+*.parquet
+*.delta
+.checkpoints/
+
+# ------------------------------ IDE / OS -------------------------------------
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

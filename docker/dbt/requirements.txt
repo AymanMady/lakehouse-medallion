@@ -1,0 +1,2 @@
+dbt-core~=1.9.0
+dbt-spark[PyHive]~=1.9.0

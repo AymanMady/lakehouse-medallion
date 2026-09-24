@@ -1,0 +1,23 @@
+# =============================================================================
+#  dbt connection profile.
+#
+#  dbt does NOT compute anything itself: it compiles Jinja+SQL and sends the
+#  statements over a Thrift (HiveServer2) connection to the Spark Thrift
+#  Server, which executes them on the Spark cluster against our Delta tables.
+#
+#  Secrets come from the environment (see .env) — never hardcoded here.
+# =============================================================================
+lakehouse_medallion:
+  target: dev
+  outputs:
+    dev:
+      type: spark
+      method: thrift
+      host: "{{ env_var('DBT_SPARK_HOST', 'spark-thrift') }}"
+      port: "{{ env_var('DBT_SPARK_PORT', '10000') | int }}"
+      schema: "{{ env_var('DBT_SPARK_SCHEMA', 'gold') }}"
+      user: lakehouse
+      connect_retries: 5
+      connect_timeout: 60
+      retry_all: true
+      threads: 4

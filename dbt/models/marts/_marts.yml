@@ -1,0 +1,66 @@
+version: 2
+
+models:
+  - name: mart_daily_sales
+    description: >
+      One row per calendar day, including days with no order. Built from
+      dim_date on the left so the series has no holes.
+    columns:
+      - name: date_key
+        tests: [not_null, unique]
+      - name: revenue
+        tests: [not_null]
+      - name: orders
+        tests: [not_null]
+
+  - name: mart_monthly_revenue
+    description: >
+      Revenue per month and country, with the month-over-month change.
+      Its grain (one row per month and country) is checked by the singular
+      test tests/assert_monthly_revenue_grain.sql.
+    columns:
+      - name: year_month
+        tests: [not_null]
+      - name: country
+        tests:
+          - not_null
+          - accepted_values:
+              values: [Mauritania, Senegal, Morocco, Mali, France, Spain, Unknown]
+
+  - name: mart_product_performance
+    description: Revenue, margin and rank per product.
+    columns:
+      - name: product_key
+        tests: [not_null, unique]
+      - name: category
+        tests: [not_null]
+      - name: rank_in_category
+        tests: [not_null]
+
+  - name: mart_customer_rfm
+    description: RFM segmentation, one row per customer who has generated revenue.
+    columns:
+      - name: customer_key
+        tests: [not_null, unique]
+      - name: r_score
+        tests:
+          - not_null
+          - accepted_values:
+              values: [1, 2, 3, 4, 5]
+              quote: false
+      - name: f_score
+        tests:
+          - accepted_values:
+              values: [1, 2, 3, 4, 5]
+              quote: false
+      - name: m_score
+        tests:
+          - accepted_values:
+              values: [1, 2, 3, 4, 5]
+              quote: false
+      - name: rfm_segment
+        tests:
+          - not_null
+          - accepted_values:
+              values: [champion, loyal, promising, needs_attention,
+                       at_risk_valuable, churned]

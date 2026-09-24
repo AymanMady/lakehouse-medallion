@@ -1,0 +1,57 @@
+# =============================================================================
+#  dbt project — the semantic layer on top of the star schema.
+#
+#  The split with Spark, and why it is not arbitrary:
+#    Spark builds the PHYSICAL model (phase 7) — row-level work on millions of
+#    Delta rows: parsing, joining facts to their lines, computing margins.
+#    dbt builds the SEMANTIC layer (phase 8) — business aggregates expressed in
+#    SQL, versioned, documented and tested declaratively.
+#
+#  So dbt does not re-do what Spark did: it declares the star schema as a
+#  SOURCE and builds the marts an analyst actually queries.
+# =============================================================================
+name: lakehouse_medallion
+version: "1.0.0"
+config-version: 2
+
+profile: lakehouse_medallion
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+analysis-paths: ["analyses"]
+
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  lakehouse_medallion:
+    # Delta everywhere: the marts stay readable by Spark, and by anything else
+    # that speaks Delta.
+    +file_format: delta
+    intermediate:
+      # Ephemeral = compiled as a CTE into the models that use it. No table is
+      # created, so an intermediate step costs nothing in storage and cannot
+      # go stale.
+      +materialized: ephemeral
+    marts:
+      # INCREMENTAL rather than TABLE, and it is not a preference - it is the
+      # only shape that survives this stack. Three facts, each reproduced:
+      #   CREATE OR REPLACE TABLE ... USING delta   always fails (see macros/)
+      #   CREATE TABLE on a virgin path             works
+      #   CREATE TABLE on a dropped path            fails: S3A leaves a fake
+      #                                             directory marker behind and
+      #                                             Delta refuses a non-empty
+      #                                             location
+      #   INSERT OVERWRITE TABLE                    works
+      # So: create once, then overwrite in place. Never drop.
+      +materialized: incremental
+      +incremental_strategy: insert_overwrite
+      # Marts live under their own prefix, separate from the star schema that
+      # Spark writes. It keeps "what Spark owns" and "what dbt owns" visible
+      # in the object store itself.
+      +location_root: "s3a://lakehouse/gold/marts"
+
+# The target schema is `gold` (DBT_SPARK_SCHEMA). No custom schema is set on
+# purpose: dbt would then name the relation `gold_gold`.

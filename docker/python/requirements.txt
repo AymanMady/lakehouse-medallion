@@ -1,0 +1,14 @@
+# --- event generation ---
+Faker==30.8.2
+# --- Kafka client (librdkafka based, production grade) ---
+confluent-kafka==2.6.1
+# --- files / object storage ---
+pandas==2.2.3
+pyarrow==17.0.0
+boto3==1.35.54
+# --- config & logging ---
+python-dotenv==1.0.1
+structlog==24.4.0
+# --- tests ---
+pytest==8.3.3
+pytest-cov==6.0.0

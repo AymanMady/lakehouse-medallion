@@ -1,0 +1,65 @@
+version: 2
+
+sources:
+  - name: gold
+    description: >
+      The star schema, built by Spark (spark/jobs/gold/build_star_schema.py).
+      Declared as a SOURCE because dbt does not build it: declaring it here is
+      what lets `source()` resolve it, what puts it in the lineage graph, and
+      what allows freshness and tests to run against it.
+    schema: gold
+    tables:
+      - name: dim_date
+        description: Generated calendar. Has no holes by construction.
+        columns:
+          - name: date_key
+            description: Integer key in yyyyMMdd form.
+            tests: [not_null, unique]
+      - name: dim_customer
+        columns:
+          - name: customer_key
+            tests: [not_null, unique]
+          - name: country
+            description: Repaired in Silver; an unknown value becomes 'Unknown'.
+            tests:
+              - not_null
+      - name: dim_product
+        columns:
+          - name: product_key
+            tests: [not_null, unique]
+          - name: unit_price
+            description: Guaranteed > 0 by the Silver rules.
+            tests: [not_null]
+      - name: fact_orders
+        description: One row per order.
+        columns:
+          - name: order_key
+            tests: [not_null, unique]
+          - name: customer_key
+            tests:
+              - not_null
+              - relationships:
+                  to: source('gold', 'dim_customer')
+                  field: customer_key
+          - name: revenue
+            description: 0 for a cancelled or returned order, never negative.
+            tests: [not_null]
+      - name: fact_order_items
+        description: One row per order line. The finest grain of the model.
+        columns:
+          - name: order_item_key
+            tests: [not_null, unique]
+          - name: order_key
+            tests:
+              - not_null
+              - relationships:
+                  to: source('gold', 'fact_orders')
+                  field: order_key
+          - name: product_key
+            tests:
+              - not_null
+              - relationships:
+                  to: source('gold', 'dim_product')
+                  field: product_key
+          - name: quantity
+            tests: [not_null]

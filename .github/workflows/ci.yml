@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Lint the Python code
+        run: ruff check .
+
+      - name: Check the shell scripts parse
+        run: |
+          find scripts docker -name '*.sh' -print0 \
+            | xargs -0 -n1 bash -n
+
+  compose:
+    name: Validate the Docker stack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `docker compose config` resolves every variable, image and volume.
+      # A typo in the stack fails here instead of after a 10-minute build.
+      - name: Validate docker-compose.yml
+        run: docker compose --env-file .env.example config --quiet
