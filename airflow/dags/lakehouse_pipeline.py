@@ -48,7 +48,10 @@ SHARED_ENV = {
     if key in os.environ
 }
 
-SPARK_ENV = {**SHARED_ENV, "PYTHONPATH": "/opt/lakehouse", "SPARK_MODE": "client"}
+# `environment` is a templated field of the DockerOperator: every Spark job of
+# one DAG run records its monitoring rows under the same run id.
+SPARK_ENV = {**SHARED_ENV, "PYTHONPATH": "/opt/lakehouse", "SPARK_MODE": "client",
+             "PIPELINE_RUN_ID": "{{ run_id }}"}
 
 
 def _mount(source: str, target: str, read_only: bool = False) -> Mount:
@@ -130,7 +133,7 @@ default_args = {
 
 with DAG(
     dag_id="lakehouse_pipeline",
-    description="Generate -> Kafka -> Bronze -> Silver -> Gold -> dbt marts",
+    description="Generate -> Kafka -> Bronze -> Silver -> Gold -> dbt marts -> health",
     start_date=datetime(2026, 1, 1),
     schedule="0 2 * * *",
     catchup=False,
@@ -177,6 +180,12 @@ with DAG(
     dbt_run = dbt_task("dbt_run", "run")
     dbt_test = dbt_task("dbt_test", "test")
 
+    # Phase 11: compares this run with the previous one (quality drift, Gold
+    # volume, Bronze freshness) and fails the task when an alert fires.
+    monitor = spark_task("pipeline_health", "spark/jobs/monitoring/pipeline_report.py",
+                         "--fail-on-alert")
+
     end = EmptyOperator(task_id="end")
 
-    start >> generate >> publish >> bronze >> silver >> gold >> dbt_run >> dbt_test >> end
+    (start >> generate >> publish >> bronze >> silver >> gold
+     >> dbt_run >> dbt_test >> monitor >> end)

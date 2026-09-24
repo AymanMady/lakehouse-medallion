@@ -15,7 +15,7 @@ What Bronze adds - and it is only metadata, never a correction:
     ingestion_timestamp  when it entered the lake
     ingestion_date       the partition column
 
-    spark-submit spark/jobs/bronze/ingest_kafka.py --mode batch
+    spark-submit spark/jobs/bronze/ingest_kafka.py --mode batch     # new messages, then stop
     spark-submit spark/jobs/bronze/ingest_kafka.py --mode stream --duration 120
 """
 
@@ -30,6 +30,7 @@ from pyspark.sql import functions as F
 
 from ingestion.generator.schemas import TOPICS
 from spark.common import config
+from spark.common.monitoring import record_metrics
 from spark.common.schemas import ENVELOPE_FIELDS
 from spark.common.session import get_logger, get_spark
 
@@ -64,34 +65,12 @@ def to_bronze(raw: DataFrame, entity: str) -> DataFrame:
     )
 
 
-def ingest_batch(spark, entity: str, starting: str) -> int:
-    raw = (
-        spark.read.format("kafka")
-        .option("kafka.bootstrap.servers", config.KAFKA_BOOTSTRAP)
-        .option("subscribe", TOPICS[entity])
-        .option("startingOffsets", starting)
-        .load()
-    )
-    bronze = to_bronze(raw, entity)
-    count = bronze.count()
-    if count == 0:
-        LOG.info(f"  {entity:<14} nothing to ingest")
-        return 0
-
-    (bronze.write.format("delta")
-     .mode("append")
-     .partitionBy("ingestion_date")
-     .option("mergeSchema", "true")
-     .save(config.table_path("bronze", entity)))
-    LOG.info(f"  {entity:<14} {count:>8,} events appended")
-    return count
-
-
-def ingest_stream(spark, entity: str, starting: str):
-    raw = (
+def _read_kafka(spark, entity: str, starting: str) -> DataFrame:
+    return (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", config.KAFKA_BOOTSTRAP)
         .option("subscribe", TOPICS[entity])
+        # Only used the very first time: afterwards the checkpoint decides.
         .option("startingOffsets", starting)
         .option("failOnDataLoss", "false")
         # Caps a micro-batch. Without it, a job restarting after an outage
@@ -99,18 +78,48 @@ def ingest_stream(spark, entity: str, starting: str):
         .option("maxOffsetsPerTrigger", 20_000)
         .load()
     )
+
+
+def _write_bronze(raw: DataFrame, entity: str):
     return (
         to_bronze(raw, entity)
         .writeStream.format("delta")
         .outputMode("append")
         .partitionBy("ingestion_date")
+        .option("path", config.table_path("bronze", entity))
         # The checkpoint holds the consumed Kafka offsets. It is what makes a
-        # restart resume instead of re-ingesting everything.
+        # restart resume instead of re-ingesting everything - and it is SHARED
+        # by the batch and the stream modes, so switching between them never
+        # ingests a message twice.
         .option("checkpointLocation", config.checkpoint_path(f"bronze_{entity}"))
         .queryName(f"bronze-{entity}")
-        .trigger(processingTime="10 seconds")
-        .start()
     )
+
+
+def ingest_batch(spark, entity: str, starting: str) -> int:
+    """A batch run with streaming bookkeeping: everything that arrived since
+    the previous run, then stop.
+
+    A plain spark.read of the topic has no memory: it re-reads from the first
+    offset every time, and a daily DAG would append the whole topic to Bronze
+    again each day. The availableNow trigger reads up to the offsets present
+    at start, in as many micro-batches as maxOffsetsPerTrigger requires, then
+    terminates - exactly-once, thanks to the checkpoint.
+    """
+    query = (_write_bronze(_read_kafka(spark, entity, starting), entity)
+             .trigger(availableNow=True).start())
+    query.awaitTermination()
+    count = sum(progress["numInputRows"] for progress in query.recentProgress)
+    if count == 0:
+        LOG.info(f"  {entity:<14} nothing new to ingest")
+    else:
+        LOG.info(f"  {entity:<14} {count:>8,} events appended")
+    return count
+
+
+def ingest_stream(spark, entity: str, starting: str):
+    return (_write_bronze(_read_kafka(spark, entity, starting), entity)
+            .trigger(processingTime="10 seconds").start())
 
 
 def register(spark, entity: str) -> None:
@@ -141,11 +150,13 @@ def main(argv: list[str] | None = None) -> int:
     LOG.info(f"Kafka -> Bronze | {config.describe()} | mode={args.mode} from={starting}")
 
     if args.mode == "batch":
-        total = 0
+        appended = {}
         for entity in args.entities:
-            total += ingest_batch(spark, entity, starting)
+            appended[entity] = ingest_batch(spark, entity, starting)
             register(spark, entity)
-        LOG.info(f"  {'TOTAL':<14} {total:>8,} events in Bronze")
+        LOG.info(f"  {'TOTAL':<14} {sum(appended.values()):>8,} events in Bronze")
+        record_metrics(spark, "bronze",
+                       {(entity, "events_appended"): n for entity, n in appended.items()})
         spark.stop()
         return 0
 

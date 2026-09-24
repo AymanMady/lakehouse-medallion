@@ -129,15 +129,22 @@ def test_nulls_are_injected_only_where_a_null_is_plausible(dataset):
         assert not missing_keys, f"{entity}: business key nulled without a corruption"
 
 
-def test_the_order_total_matches_the_sum_of_its_lines(clean):
+def test_the_order_total_matches_the_sum_of_its_lines():
     """The total is COMPUTED from the lines, never drawn at random.
 
     If it were random, the Gold layer's consistency check would be comparing
     two unrelated numbers and would never catch anything.
+
+    Checked on an UNCORRUPTED dataset: filtering the corrupted lines out of a
+    corrupted one leaves orders with only part of their lines, whose total then
+    legitimately differs from the partial sum.
     """
-    totals = {o["order_id"]: o["total_amount"] for o in clean["orders"]}
+    events = generate(customers=200, products=50, orders=800, seed=7,
+                      null_rate=0, duplicate_rate=0, invalid_rate=0)
+    totals = {e["payload"]["order_id"]: e["payload"]["total_amount"]
+              for e in events["orders"]}
     summed: dict[int, float] = {}
-    for item in clean["order_items"]:
+    for item in (e["payload"] for e in events["order_items"]):
         summed.setdefault(item["order_id"], 0.0)
         summed[item["order_id"]] += (
             item["quantity"] * item["unit_price"] * (1 - item["discount_pct"]))

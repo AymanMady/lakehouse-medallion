@@ -84,7 +84,16 @@ class QualityReport:
 
     @property
     def valid_ratio(self) -> float:
-        return (self.rows_valid / self.rows_read) if self.rows_read else 0.0
+        """Share of the DISTINCT rows checked that passed.
+
+        Duplicates are left out of the denominator on purpose: Kafka delivers
+        at least once and every run re-emits the same entities, so they are
+        expected, not bad data. Counting them would make the ratio fall with
+        every re-run of the same data until the gate stopped the pipeline.
+        Accounting identity: rows_read = valid + invalid + duplicated.
+        """
+        checked = self.rows_valid + self.rows_invalid
+        return (self.rows_valid / checked) if checked else 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {

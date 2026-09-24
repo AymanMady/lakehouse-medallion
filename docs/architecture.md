@@ -18,6 +18,7 @@ flowchart TD
         S["SILVER<br/><i>deduplicated, typed,<br/>validated</i>"]
         Q["QUARANTINE<br/><i>rejected rows<br/>+ rejection reason</i>"]
         G["GOLD<br/><i>star schema<br/>+ aggregates</i>"]
+        M["MONITORING<br/><i>quality_runs, metrics<br/>append-only history</i>"]
     end
 
     subgraph COMPUTE["COMPUTE"]
@@ -41,11 +42,14 @@ flowchart TD
     B --> SP
     SP --> S
     SP -.rejected.-> Q
-    S --> DBT
-    DBT --> G
+    S --> SP
+    SP --> G
+    G --> DBT
+    DBT -.marts.-> G
     G --> BI
     G --> ML
     G --> SQL
+    SP -.every run.-> M
 
     AF -.orchestrates.-> SP
     AF -.orchestrates.-> DBT
@@ -71,7 +75,8 @@ flowchart TD
 | **Bronze** | Spark (Structured Streaming + batch) | Kafka, CSV | Delta, partitioned by `ingestion_date` | *Never alter the source data.* Append-only. |
 | **Silver** | Spark (PySpark) | Bronze Delta | Delta, one table per entity | *A Silver row is a row whose validity can be proven.* |
 | **Quarantine** | Spark | Silver (rejects) | Delta + `rejection_reason` | *An invalid row is never deleted, only isolated.* |
-| **Gold** | dbt on Spark | Silver Delta | Delta, star schema | *Business vocabulary only.* |
+| **Gold** | Spark (star schema) + dbt (marts) | Silver Delta | Delta, star schema + marts | *Business vocabulary only.* |
+| **Monitoring** | every Spark job | job results | Delta, append-only | *Every run leaves a trace, including the failed ones.* |
 
 ## 3. Splitting the work between Spark and dbt
 
@@ -81,9 +86,10 @@ flowchart TD
 | Parse malformed JSON | **Spark** | row-by-row control, exception handling |
 | Route to quarantine | **Spark** | conditional write to two destinations |
 | Deduplicate / `MERGE INTO` | **Spark** | programmatic Delta API |
-| Build `dim_customer` (SCD) | **dbt** | declarative snapshot, versioned in SQL |
-| Compute `daily_sales` | **dbt** | pure SQL aggregate, testable |
-| Test `not_null` / `unique` | **dbt** | declarative tests in YAML |
+| Build the star schema (dimensions, facts) | **Spark** | row-level joins on the full Silver tables, measured join losses |
+| Compute the marts (`mart_daily_sales`, RFM...) | **dbt** | pure SQL aggregates and window functions, easy to review |
+| Test `not_null` / `unique` / business rules | **dbt** | declarative tests in YAML, singular tests in SQL |
+| Record quality and volume per run | **Spark** | written by the jobs that know the numbers |
 
 ## 4. Exposed ports
 
@@ -118,6 +124,10 @@ ones show up in production.
 | `Required table missing: TBL_PRIVS` | `autoCreateAll` creates tables **lazily** | same as above |
 | `Airflow has no username` | official entrypoint bypassed | `exec /entrypoint`, service runs as `user: "0:0"` |
 | dbt failing silently (`rc=2`) | container uid ≠ bind mount owner | dbt runs as `HOST_UID:HOST_GID` |
+| Bronze doubling on every run | a batch `spark.read` of Kafka has no memory and restarts from the first offset | `availableNow` trigger + checkpoint: batch semantics, streaming bookkeeping |
+| `'path' is not specified` on a Delta stream | `writeStream.start()` without a destination | `.option("path", ...)` on the writer |
+| Silver gate failing on the 2nd run of unchanged data | duplicates counted in the valid ratio's denominator, rejects never deduplicated | ratio over distinct checked rows; rejects deduplicated on the business key |
+| Freshness showing a negative age | `collect()` converts timestamps to the container's local time zone, not the session's UTC | age computed inside Spark |
 
 ## 6. Architecture decisions
 

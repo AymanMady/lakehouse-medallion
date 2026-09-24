@@ -55,6 +55,73 @@ smoke:  ## Phase 1 end-to-end check: Delta + MinIO + Metastore
 > $(COMPOSE) exec -T spark-master /opt/spark/bin/spark-submit \
 >   --master "local[2]" /opt/lakehouse/scripts/smoke_test_delta.py
 
+## ------------------------------------------------------------ Pipeline ----
+#  Each step can be run on its own; `make pipeline` chains them, which is what
+#  the Airflow DAG does too. RUN_ID ties together the monitoring rows that the
+#  Spark jobs of one run record (Airflow passes its own run_id instead).
+
+export RUN_ID := $(or $(RUN_ID),manual__$(shell date -u +%Y%m%dT%H%M%S))
+p ?= small
+t ?= orders
+SPARK_SUBMIT := $(COMPOSE) exec -T -e PIPELINE_RUN_ID=$(RUN_ID) spark-master \
+                /opt/spark/bin/spark-submit --master "local[2]"
+DBT := $(COMPOSE) exec -T dbt dbt
+
+generate:  ## Phase 2: generate the dataset  (make generate p=tiny|small|medium|large)
+> $(COMPOSE) exec -T datagen python3 -m ingestion.generator.generate \
+>   --preset $(p) --out /opt/lakehouse/data/raw
+
+produce:  ## Phase 3: publish data/raw/*.jsonl to Kafka
+> $(COMPOSE) exec -T datagen python3 -m ingestion.producers.kafka_producer \
+>   --source /opt/lakehouse/data/raw
+
+inspect:  ## Phase 3: show offsets and sample messages  (make inspect t=orders)
+> $(COMPOSE) exec -T datagen python3 -m ingestion.consumers.inspect_topic --topic $(t)
+
+bronze:  ## Phase 4: Kafka -> Bronze Delta tables
+> $(SPARK_SUBMIT) /opt/lakehouse/spark/jobs/bronze/ingest_kafka.py --mode batch
+
+silver:  ## Phases 5-6: Bronze -> Silver + quarantine
+> $(SPARK_SUBMIT) /opt/lakehouse/spark/jobs/silver/bronze_to_silver.py
+
+gold:  ## Phase 7: Silver -> Gold star schema
+> $(SPARK_SUBMIT) /opt/lakehouse/spark/jobs/gold/build_star_schema.py
+
+dbt-run:  ## Phase 8: build the dbt marts
+> $(DBT) run
+
+dbt-test:  ## Phase 8: run the dbt tests (sources, marts, singular tests)
+> $(DBT) test
+
+monitor:  ## Phase 11: health report - quality drift, Gold volume, freshness
+> $(SPARK_SUBMIT) /opt/lakehouse/spark/jobs/monitoring/pipeline_report.py
+
+pipeline:  ## Run every step, generate -> monitor, under one RUN_ID
+> @echo "  run id: $(RUN_ID)"
+> @for step in generate produce bronze silver gold dbt-run dbt-test monitor; do \
+>   echo ""; echo "==> $$step"; \
+>   $(MAKE) --no-print-directory $$step RUN_ID=$(RUN_ID) || exit 1; \
+> done
+
+reset:  ## DESTRUCTIVE: empty topics, lake and catalog (containers keep running)
+> @./scripts/reset_data.sh
+
+dag-trigger:  ## Phase 9: unpause and trigger the Airflow DAG
+> $(COMPOSE) exec -T airflow-scheduler airflow dags unpause lakehouse_pipeline
+> $(COMPOSE) exec -T airflow-scheduler airflow dags trigger lakehouse_pipeline
+
+## -------------------------------------------------------------- Tests -----
+
+test:  ## Phase 10: unit tests (pure Python, ~1 s)
+> $(COMPOSE) exec -T -w /opt/lakehouse datagen python3 -m pytest -p no:cacheprovider -q tests/unit
+
+test-integration:  ## Phase 10: Spark integration tests, in the Spark image (~1 min)
+> $(COMPOSE) run --rm --no-deps -T -e SPARK_MODE=client -w /opt/lakehouse spark-master \
+>   python3 -m pytest -p no:cacheprovider -q tests
+
+lint:  ## Lint the Python code (needs ruff on the host: pip install ruff)
+> ruff check .
+
 ## ------------------------------------------------------------- Shells -----
 
 shell-spark:  ## Bash inside the Spark master container
@@ -106,5 +173,7 @@ creds:  ## Print local UI credentials from .env
 > @echo ""
 
 .PHONY: help init build up up-core down restart clean ps health logs smoke \
+        generate produce inspect bronze silver gold dbt-run dbt-test monitor \
+        pipeline reset dag-trigger test test-integration lint \
         shell-spark pyspark spark-sql shell-dbt shell-gen psql \
         topics topic-describe consume ls-lake creds

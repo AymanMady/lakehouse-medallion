@@ -14,7 +14,7 @@ set -euo pipefail
 COMPOSE="docker compose"
 BUCKET="${LAKEHOUSE_BUCKET:-lakehouse}"
 TOPICS="customers products orders order_items payments shipments dead_letter"
-LAYERS="bronze silver gold quarantine _checkpoints"
+LAYERS="bronze silver gold quarantine monitoring _checkpoints"
 
 if [ "${1:-}" != "--yes" ]; then
     printf "  This deletes every Kafka message and everything in the lake. Continue? [y/N] "
@@ -48,10 +48,11 @@ DROP DATABASE IF EXISTS bronze CASCADE;
 DROP DATABASE IF EXISTS silver CASCADE;
 DROP DATABASE IF EXISTS gold CASCADE;
 DROP DATABASE IF EXISTS quarantine CASCADE;
+DROP DATABASE IF EXISTS monitoring CASCADE;
 " >/dev/null 2>&1 || true
 
 echo "[reset] re-registering the databases"
 $COMPOSE exec -T spark-master /opt/spark/bin/spark-submit \
     --master "local[1]" /opt/lakehouse/scripts/init_metastore.py 2>&1 | grep -E "^\[metastore" || true
 
-echo "[reset] done. Next: make generate && make produce && make bronze"
+echo "[reset] done. Next: make pipeline  (or make generate && make produce && make bronze ...)"

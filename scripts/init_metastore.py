@@ -2,7 +2,7 @@
 =============================================================================
  One-shot Hive Metastore bootstrap.
 
- Registers the four medallion databases in the Hive catalog, so that
+ Registers the medallion databases (plus `monitoring`) in the Hive catalog, so that
  `SELECT * FROM silver.orders` works in Spark SQL and in dbt.
 
  The metastore TABLES are NOT created here: PostgreSQL loads the official Hive
@@ -28,6 +28,7 @@ DATABASES = {
     "silver": f"s3a://{BUCKET}/silver",
     "gold": f"s3a://{BUCKET}/gold",
     "quarantine": f"s3a://{BUCKET}/quarantine",
+    "monitoring": f"s3a://{BUCKET}/monitoring",
 }
 
 

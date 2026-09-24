@@ -28,6 +28,25 @@ jobs:
           find scripts docker -name '*.sh' -print0 \
             | xargs -0 -n1 bash -n
 
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Only what the pure-Python tests need, pinned like docker/python.
+      # The Spark integration tests are not collected without PySpark; they
+      # run in the Spark image with `make test-integration`.
+      - name: Install the test dependencies
+        run: pip install Faker==30.8.2 pytest==8.3.3
+
+      - name: Run the unit tests
+        run: python -m pytest -q tests
+
   compose:
     name: Validate the Docker stack
     runs-on: ubuntu-latest

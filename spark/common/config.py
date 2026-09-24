@@ -17,12 +17,14 @@ BRONZE = f"s3a://{BUCKET}/bronze"
 SILVER = f"s3a://{BUCKET}/silver"
 GOLD = f"s3a://{BUCKET}/gold"
 QUARANTINE = f"s3a://{BUCKET}/quarantine"
+MONITORING = f"s3a://{BUCKET}/monitoring"
 CHECKPOINTS = f"s3a://{BUCKET}/_checkpoints"
 
 # The catalog databases registered by scripts/init_metastore.py. Registering a
 # Delta path as a table is what makes `SELECT * FROM silver.orders` work in
 # Spark SQL and in dbt, instead of forcing everyone to know the s3a:// path.
-DATABASES = {"bronze": BRONZE, "silver": SILVER, "gold": GOLD, "quarantine": QUARANTINE}
+DATABASES = {"bronze": BRONZE, "silver": SILVER, "gold": GOLD, "quarantine": QUARANTINE,
+             "monitoring": MONITORING}
 
 LOCAL_RAW = os.getenv("LAKEHOUSE_RAW_DIR", "/opt/lakehouse/data/raw")
 

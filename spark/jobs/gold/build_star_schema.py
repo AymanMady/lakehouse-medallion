@@ -26,6 +26,7 @@ from pyspark.sql import functions as F
 
 from ingestion.generator.schemas import REVENUE_STATUSES
 from spark.common import config
+from spark.common.monitoring import record_metrics
 from spark.common.session import get_logger, get_spark
 
 LOG = get_logger("gold")
@@ -220,17 +221,30 @@ def main(argv: list[str] | None = None) -> int:
     end = args.calendar_end or bounds["hi"].strftime("%Y-%m-%d")
     LOG.info(f"  calendar {start} -> {end}")
 
-    write(dim_date(spark, start, end), "dim_date", spark)
-    write(dim_customer(customers), "dim_customer", spark)
-    write(dim_product(products), "dim_product", spark)
-    write(fact_orders(orders, items), "fact_orders", spark)
+    counts = {
+        "dim_date": write(dim_date(spark, start, end), "dim_date", spark),
+        "dim_customer": write(dim_customer(customers), "dim_customer", spark),
+        "dim_product": write(dim_product(products), "dim_product", spark),
+    }
+    facts = fact_orders(orders, items)
+    counts["fact_orders"] = write(facts, "fact_orders", spark)
 
     fact_items, loss = fact_order_items(items, orders, products)
-    write(fact_items, "fact_order_items", spark)
+    counts["fact_order_items"] = write(fact_items, "fact_order_items", spark)
     if loss["lost"]:
         LOG.info(f"  inner joins dropped {loss['lost']:,} of {loss['rows_in']:,} lines "
                  f"({loss['lost'] / loss['rows_in']:.2%}): their order or product "
                  f"is absent from Silver")
+
+    gold = spark.read.format("delta").load(config.table_path("gold", "fact_orders"))
+    totals = gold.agg(F.sum("revenue").alias("revenue"),
+                      F.sum(F.when(F.col("amount_gap") > 0.05, 1).otherwise(0))
+                      .alias("gapped")).first()
+    metrics = {(name, "row_count"): count for name, count in counts.items()}
+    metrics[("fact_order_items", "lines_lost_in_joins")] = loss["lost"]
+    metrics[("fact_orders", "revenue")] = totals["revenue"] or 0.0
+    metrics[("fact_orders", "orders_with_amount_gap")] = totals["gapped"] or 0
+    record_metrics(spark, "gold", metrics)
 
     LOG.info("  Gold layer ready.")
     spark.stop()

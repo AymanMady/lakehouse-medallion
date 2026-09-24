@@ -8,3 +8,5 @@ boto3==1.35.54
 # Integration tests run INSIDE this image: testing against a different
 # PySpark than the one the jobs use would test a different stack.
 pytest==8.3.3
+# The Silver integration tests feed the real rules with generated events.
+Faker==30.8.2

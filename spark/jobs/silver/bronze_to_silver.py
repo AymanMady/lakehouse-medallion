@@ -41,6 +41,7 @@ from spark.common.data_quality import (
     log_report,
     split_valid_invalid,
 )
+from spark.common.monitoring import record_quality
 from spark.common.schemas import payload_schema, silver_schema
 from spark.common.session import get_logger, get_spark
 from spark.jobs.silver.rules import repair, rules_for
@@ -182,6 +183,25 @@ def write_quarantine(invalid: DataFrame, entity: str, spark) -> None:
               f"USING DELTA LOCATION '{path}'")
 
 
+def annotate(parsed: DataFrame, entity: str,
+             silver: dict[str, DataFrame]) -> tuple[DataFrame, int]:
+    """Steps 3 to 7: every row, valid or not, with its list of violated rules.
+
+    Pure DataFrame work, no I/O - which is what lets the integration tests run
+    the real Silver logic on an in-memory DataFrame.
+    Returns (annotated rows, technical duplicates removed).
+    """
+    # 3. technical duplicates: the SAME message delivered twice.
+    deduped_events, dup_events = deduplicate(parsed, "event_id", "ingestion_timestamp")
+
+    typed = cast_types(deduped_events, entity)
+    repaired = repair(entity, typed)
+
+    annotated = apply_rules(repaired, rules_for(entity))
+    annotated = check_foreign_keys(annotated, entity, silver)
+    return annotated, dup_events
+
+
 def process(spark, entity: str, silver: dict[str, DataFrame],
             min_ratio: float) -> QualityReport:
     bronze = spark.read.format("delta").load(config.table_path("bronze", entity))
@@ -189,34 +209,34 @@ def process(spark, entity: str, silver: dict[str, DataFrame],
     parsed = parse_payload(bronze, entity)
     rows_read = parsed.count()
 
-    # 3. technical duplicates: the SAME message delivered twice.
-    deduped_events, dup_events = deduplicate(parsed, "event_id", "ingestion_timestamp")
-
-    typed = cast_types(deduped_events, entity)
-    repaired = repair(entity, typed)
-
     rules = rules_for(entity)
-    annotated = apply_rules(repaired, rules)
-    annotated = check_foreign_keys(annotated, entity, silver)
+    annotated, dup_events = annotate(parsed, entity, silver)
     annotated.persist()
 
     valid, invalid = split_valid_invalid(annotated)
 
     # 8. business duplicates: the same entity emitted twice with different
-    # values. Only valid rows are deduplicated - a reject keeps its trace.
+    # values - keep the latest version.
     key = BUSINESS_KEYS[entity]
     valid, dup_business = deduplicate(valid, key, "occurred_at")
+    # The same rejected entity re-emitted by every run is ONE problem, not N:
+    # left alone, the quarantine would grow with each run while Silver does
+    # not, and the valid ratio would drift down on unchanged data. A reject
+    # with no business key cannot be matched to anything, so all are kept.
+    keyed, dup_rejected = deduplicate(invalid.filter(F.col(key).isNotNull()),
+                                      key, "occurred_at")
+    invalid = keyed.unionByName(invalid.filter(F.col(key).isNull()))
 
     report = QualityReport(
         dataset=entity,
         rows_read=rows_read,
         rows_valid=valid.count(),
         rows_invalid=invalid.count(),
-        rows_duplicated=dup_events + dup_business,
-        failures=count_failures(annotated, rules),
+        rows_duplicated=dup_events + dup_business + dup_rejected,
+        failures=count_failures(invalid, rules),
     )
     # The orphan counts come from the FK step, not from `rules`.
-    orphan_counts = (annotated.select(F.explode(ERROR_COL).alias("rule"))
+    orphan_counts = (invalid.select(F.explode(ERROR_COL).alias("rule"))
                      .filter(F.col("rule").startswith("fk_orphan_"))
                      .groupBy("rule").count().collect())
     for row in orphan_counts:
@@ -226,6 +246,9 @@ def process(spark, entity: str, silver: dict[str, DataFrame],
     write_quarantine(invalid, entity, spark)
 
     log_report(LOG, report)
+    # Recorded BEFORE the gate: a run that fails it is the one you will want
+    # to find in the history afterwards.
+    record_quality(spark, report, min_ratio)
     assert_quality(report, min_ratio, LOG)
 
     silver[entity] = spark.read.format("delta").load(config.table_path("silver", entity))
